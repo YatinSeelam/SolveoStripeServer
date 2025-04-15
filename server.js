@@ -678,12 +678,12 @@ async function checkUserPremiumStatus(email) {
               // End date is in the future - user is premium regardless of cancellation
               isPremium = true;
               reason = isCancelled ? 
-                'Premium until end date despite cancellation' : 
-                'Active subscription';
+                `Premium until ${endDate} despite cancellation` : 
+                `Active subscription until ${endDate}`;
             } else {
               // End date has passed
               isPremium = false;
-              reason = 'Subscription expired';
+              reason = `Subscription expired on ${endDate}`;
             }
           } else {
             // No end date - lifetime subscription unless cancelled
@@ -747,28 +747,36 @@ app.post('/api/verify-user', async (req, res) => {
     // Check user premium status in Google Sheet
     const userStatus = await checkUserPremiumStatus(email);
     
-    // Only generate a JWT token if user is found in database
-    const token = jwt.sign(
-      { 
-        email, 
-        isPremium: userStatus.isPremium,
-        isInSheet: userStatus.isInSheet
-      },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-    
-    console.log(`User ${email} premium status: ${userStatus.isPremium}`);
-    
-    // Return user status and new token
-    return res.json({
+    // Build response object without token initially
+    const responseObj = {
       email,
       isPremium: userStatus.isPremium,
       isInSheet: userStatus.isInSheet,
       subscriptionData: userStatus.subscriptionData,
-      message: userStatus.message,
-      token
-    });
+      message: userStatus.message
+    };
+    
+    // Only generate a JWT token if user is found in the sheet
+    if (userStatus.isInSheet) {
+      const token = jwt.sign(
+        { 
+          email, 
+          isPremium: userStatus.isPremium,
+          isInSheet: userStatus.isInSheet
+        },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+      
+      // Add token to response only if user exists in sheet
+      responseObj.token = token;
+      console.log(`User ${email} found in sheet, premium status: ${userStatus.isPremium}`);
+    } else {
+      console.log(`User ${email} not found in sheet, no token generated`);
+    }
+    
+    // Return user status (with token only if user exists)
+    return res.json(responseObj);
     
   } catch (error) {
     console.error('Error in verify-user endpoint:', error);
@@ -787,22 +795,45 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
     
     console.log(`Chat request from ${email}: "${message}"`);
     
-    // Check premium status from token
-    if (!req.user.isPremium) {
-      // Double check with database for absolute verification
-      const userStatus = await checkUserPremiumStatus(email);
-      if (!userStatus.isPremium) {
-        console.log(`Premium feature unavailable for user: ${email}`);
-        return res.status(403).json({ 
-          error: 'Premium feature unavailable',
-          reason: userStatus.message || userStatus.subscriptionData?.reason || 'Not a premium user'
-        });
-      }
+    // Always verify with the database regardless of token
+    // This ensures we have the latest premium status
+    const userStatus = await checkUserPremiumStatus(email);
+    
+    // Verify the email in token matches the email in request
+    if (req.user.email !== email) {
+      console.log(`Token email (${req.user.email}) doesn't match request email (${email})`);
+      return res.status(403).json({ 
+        error: 'Authentication error',
+        reason: 'Token email mismatch'
+      });
+    }
+    
+    // Verify user is in sheet and has premium status
+    if (!userStatus.isInSheet) {
+      console.log(`User not found in database: ${email}`);
+      return res.status(403).json({ 
+        error: 'Premium feature unavailable',
+        reason: 'User not found in database'
+      });
+    }
+    
+    if (!userStatus.isPremium) {
+      console.log(`Premium feature unavailable for user: ${email}`);
+      return res.status(403).json({ 
+        error: 'Premium feature unavailable',
+        reason: userStatus.subscriptionData?.reason || 'Not a premium user'
+      });
     }
     
     // Process chat message (simulated AI response)
     const aiResponse = `This is a simulated AI response to: "${message}"`;
-    return res.json({ response: aiResponse });
+    return res.json({ 
+      response: aiResponse,
+      subscriptionInfo: {
+        endDate: userStatus.subscriptionData?.endDate,
+        daysRemaining: userStatus.subscriptionData?.daysRemaining
+      }
+    });
     
   } catch (error) {
     console.error('Error in chat endpoint:', error);
