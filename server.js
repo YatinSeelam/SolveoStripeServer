@@ -437,6 +437,7 @@
 //   console.log('\nReady to handle requests');
 // });
 // Final server implementation
+// Final server implementation
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
@@ -624,22 +625,23 @@ async function checkUserPremiumStatus(email) {
           
           console.log(`Subscription details: Started ${startDate}, Ends ${endDate || 'Never'}, Cancelled: ${isCancelled}`);
           
-          let isPremium = true;
+          // Default to false and only set to true if all conditions are met
+          let isPremium = false;
           
-          // Check if subscription has expired
+          // Check if subscription has not expired
           if (endDate) {
             const now = new Date();
             const subscriptionEnd = new Date(endDate);
-            if (subscriptionEnd < now) {
-              console.log('Subscription has expired');
-              isPremium = false;
+            
+            // User is premium only if their subscription hasn't expired AND they haven't cancelled
+            if (subscriptionEnd >= now && !isCancelled) {
+              isPremium = true;
+            } else {
+              console.log('Subscription has expired or is cancelled');
             }
-          }
-          
-          // If cancelled, not premium
-          if (isCancelled) {
-            console.log('Subscription is cancelled');
-            isPremium = false;
+          } else if (!isCancelled) {
+            // No end date (perhaps lifetime subscription) and not cancelled
+            isPremium = true;
           }
           
           return {
