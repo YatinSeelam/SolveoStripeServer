@@ -483,7 +483,7 @@ function getServiceAccountCredentials() {
   };
 }
 
-// Basic token validation
+// Token validation
 function authenticateToken(req, res, next) {
   // Get token from Authorization header
   const authHeader = req.headers['authorization'];
@@ -506,7 +506,7 @@ function authenticateToken(req, res, next) {
   // Very long tokens are likely Google tokens, not our JWT
   if (token.length > 1000) {
     // For development, just accept Google tokens
-    req.user = { email: req.body.email, isPremium: true };
+    req.user = { email: req.body.email, isPremium: false };
     return next();
   } else {
     // This is our JWT token
@@ -564,12 +564,33 @@ async function initializeSheetsClient() {
   }
 }
 
+// Calculate days remaining in subscription
+function calculateDaysRemaining(endDateStr) {
+  if (!endDateStr) return null;
+  
+  const endDate = new Date(endDateStr);
+  const now = new Date();
+  
+  // If end date is in the past, return 0
+  if (endDate < now) return 0;
+  
+  // Calculate days difference
+  const diffTime = endDate - now;
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  
+  return diffDays;
+}
+
 // Check if user is premium by looking up in Google Sheet
 async function checkUserPremiumStatus(email) {
   console.log(`Checking premium status for: ${email}`);
   
   if (!email) {
-    return { isPremium: false };
+    return { 
+      isPremium: false, 
+      isInSheet: false,
+      message: 'No email provided'
+    };
   }
   
   try {
@@ -578,7 +599,11 @@ async function checkUserPremiumStatus(email) {
       const initialized = await initializeSheetsClient();
       if (!initialized) {
         console.log('Google Sheets client initialization failed, using fallback');
-        return { isPremium: false };
+        return { 
+          isPremium: false, 
+          isInSheet: false,
+          message: 'Failed to connect to database'
+        };
       }
     }
     
@@ -591,7 +616,11 @@ async function checkUserPremiumStatus(email) {
     const rows = response.data.values;
     if (!rows || rows.length === 0) {
       console.log('No data found in sheet');
-      return { isPremium: false };
+      return { 
+        isPremium: false, 
+        isInSheet: false,
+        message: 'No data in database'
+      };
     }
     
     // Find the header row to get column indexes
@@ -604,7 +633,11 @@ async function checkUserPremiumStatus(email) {
     
     if (emailColumnIndex === -1) {
       console.error('Email column not found in spreadsheet');
-      return { isPremium: false };
+      return { 
+        isPremium: false, 
+        isInSheet: false,
+        message: 'Database structure error'
+      };
     }
     
     // Look for user email
@@ -625,31 +658,50 @@ async function checkUserPremiumStatus(email) {
           
           console.log(`Subscription details: Started ${startDate}, Ends ${endDate || 'Never'}, Cancelled: ${isCancelled}`);
           
-          // Default to false and only set to true if all conditions are met
-          let isPremium = false;
+          // Calculate days remaining
+          const daysRemaining = endDate ? calculateDaysRemaining(endDate) : null;
           
-          // Check if subscription has not expired
+          // NEW PREMIUM LOGIC:
+          // User is premium if:
+          // 1. They are in the sheet AND
+          // 2. Either:
+          //    a. They haven't cancelled OR
+          //    b. End date hasn't passed (even if cancelled)
+          let isPremium = false;
+          let reason = '';
+          
           if (endDate) {
             const now = new Date();
             const subscriptionEnd = new Date(endDate);
             
-            // User is premium only if their subscription hasn't expired AND they haven't cancelled
-            if (subscriptionEnd >= now && !isCancelled) {
+            if (subscriptionEnd >= now) {
+              // End date is in the future - user is premium regardless of cancellation
               isPremium = true;
+              reason = isCancelled ? 
+                'Premium until end date despite cancellation' : 
+                'Active subscription';
             } else {
-              console.log('Subscription has expired or is cancelled');
+              // End date has passed
+              isPremium = false;
+              reason = 'Subscription expired';
             }
-          } else if (!isCancelled) {
-            // No end date (perhaps lifetime subscription) and not cancelled
-            isPremium = true;
+          } else {
+            // No end date - lifetime subscription unless cancelled
+            isPremium = !isCancelled;
+            reason = isCancelled ? 
+              'Lifetime subscription cancelled' : 
+              'Lifetime subscription active';
           }
           
           return {
             isPremium,
+            isInSheet: true,
             subscriptionData: {
               startDate,
               endDate,
-              isCancelled
+              isCancelled,
+              daysRemaining,
+              reason
             }
           };
         }
@@ -658,11 +710,19 @@ async function checkUserPremiumStatus(email) {
     
     // User not found in sheet
     console.log(`User ${email} not found in premium sheet`);
-    return { isPremium: false };
+    return { 
+      isPremium: false, 
+      isInSheet: false,
+      message: 'User not found in database'
+    };
     
   } catch (error) {
     console.error('Error checking user premium status:', error);
-    return { isPremium: false };
+    return { 
+      isPremium: false, 
+      isInSheet: false,
+      message: 'Server error checking status'
+    };
   }
 }
 
@@ -687,9 +747,13 @@ app.post('/api/verify-user', async (req, res) => {
     // Check user premium status in Google Sheet
     const userStatus = await checkUserPremiumStatus(email);
     
-    // Generate a JWT token for future requests
+    // Only generate a JWT token if user is found in database
     const token = jwt.sign(
-      { email, isPremium: userStatus.isPremium },
+      { 
+        email, 
+        isPremium: userStatus.isPremium,
+        isInSheet: userStatus.isInSheet
+      },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
@@ -700,7 +764,9 @@ app.post('/api/verify-user', async (req, res) => {
     return res.json({
       email,
       isPremium: userStatus.isPremium,
+      isInSheet: userStatus.isInSheet,
       subscriptionData: userStatus.subscriptionData,
+      message: userStatus.message,
       token
     });
     
@@ -727,7 +793,10 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
       const userStatus = await checkUserPremiumStatus(email);
       if (!userStatus.isPremium) {
         console.log(`Premium feature unavailable for user: ${email}`);
-        return res.status(403).json({ error: 'Premium feature unavailable' });
+        return res.status(403).json({ 
+          error: 'Premium feature unavailable',
+          reason: userStatus.message || userStatus.subscriptionData?.reason || 'Not a premium user'
+        });
       }
     }
     
@@ -754,7 +823,6 @@ app.listen(PORT, async () => {
   console.log(`- Test: http://localhost:${PORT}/api/test`);
   console.log(`- Verify User: http://localhost:${PORT}/api/verify-user`);
   console.log(`- Chat: http://localhost:${PORT}/api/chat (Protected, Premium)`);
-  console.log(`- List Users: http://localhost:${PORT}/api/list-users (DEVELOPMENT ONLY)`);
   
   console.log('\nReady to handle requests');
 });
