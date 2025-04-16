@@ -1,33 +1,31 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
-// Initialize Express app
+// === App setup ===
 const app = express();
-
-// CORS configuration
-app.use(cors({
-  origin: ['chrome-extension://*', 'http://localhost:3000', '*'],
-  methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: true
-}));
-
-app.use(express.json());
-
-// Configuration from .env file
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    // allow your Chrome extension too:
+    /^chrome-extension:\/\/.+$/
+  ],
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+app.use(express.json());
+
+// === Google Sheets client init ===
+let sheetsClient = null;
 let SHEET_TAB_NAME = null;
 
-console.log('Starting server with configuration:');
-console.log(`- PORT: ${PORT}`);
-console.log(`- JWT_SECRET: ${JWT_SECRET ? "Configured" : "Missing"}`);
-console.log(`- GOOGLE_SHEET_ID: ${GOOGLE_SHEET_ID}`);
-
-// Helper: Build the service account object from environment variables
 function getServiceAccountCredentials() {
   return {
     type: process.env.SERVICE_ACCOUNT_TYPE,
@@ -43,404 +41,193 @@ function getServiceAccountCredentials() {
   };
 }
 
-// Token validation
-function authenticateToken(req, res, next) {
-  // Get token from Authorization header
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  
-  // For development: Allow token bypass with query param
-  if (req.query.dev === 'true') {
-    console.log('⚠️ Development mode: authentication bypassed');
-    req.user = { 
-      email: req.body.email || req.query.email || 'dev@example.com',
-      isPremium: true
-    };
-    return next();
-  }
-  
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-  
-  // Very long tokens are likely Google tokens, not our JWT
-  if (token.length > 1000) {
-    // For development, just accept Google tokens
-    req.user = { email: req.body.email, isPremium: false };
-    return next();
-  } else {
-    // This is our JWT token
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-      if (err) {
-        console.error('JWT verification error:', err);
-        return res.status(403).json({ error: 'Invalid token' });
-      }
-      
-      req.user = user;
-      next();
-    });
-  }
-}
-
-// Initialize Google Sheets API client
-let sheetsClient = null;
-
-// Initialize Google Sheets client
 async function initializeSheetsClient() {
-  console.log('Initializing Google Sheets client...');
-  
-  try {
-    // Construct credentials from environment variables
-    const credentials = getServiceAccountCredentials();
-    
-    // Use them in GoogleAuth
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
-    });
-    
-    const authClient = await auth.getClient();
-    sheetsClient = google.sheets({ version: 'v4', auth: authClient });
-    
-    console.log('Google Sheets API client initialized successfully');
-    
-    // Test the connection
-    const test = await sheetsClient.spreadsheets.get({
-      spreadsheetId: GOOGLE_SHEET_ID
-    });
-    
-    console.log(`Connected to Google Sheet: ${test.data.properties.title}`);
-    
-    // Set sheet tab name
-    SHEET_TAB_NAME = test.data.sheets[0].properties.title;
-    console.log(`Using sheet tab: ${SHEET_TAB_NAME}`);
-    
-    return true;
-    
-  } catch (error) {
-    console.error('Error initializing Google Sheets client:', error);
-    console.error('Check your service account credentials in .env file');
-    return false;
-  }
+  const creds = getServiceAccountCredentials();
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
+  });
+  const client = await auth.getClient();
+  sheetsClient = google.sheets({ version: 'v4', auth: client });
+
+  // Grab first sheet name
+  const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
+  SHEET_TAB_NAME = meta.data.sheets[0].properties.title;
+  console.log(`✅ Sheets initialized, using tab "${SHEET_TAB_NAME}"`);
 }
 
-// Calculate days remaining in subscription
+// === Helpers ===
 function calculateDaysRemaining(endDateStr) {
-  if (!endDateStr) return null;
-  
-  const endDate = new Date(endDateStr);
   const now = new Date();
-  
-  // If end date is in the past, return 0
-  if (endDate < now) return 0;
-  
-  // Calculate days difference
-  const diffTime = endDate - now;
-  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-  
-  return diffDays;
+  const end = new Date(endDateStr);
+  if (isNaN(end)) return null;
+  if (end < now) return 0;
+  return Math.ceil((end - now) / (1000 * 60 * 60 * 24));
 }
 
-// Check if user is premium by looking up in Google Sheet
 async function checkUserPremiumStatus(email) {
-  console.log(`Checking premium status for: ${email}`);
-  
   if (!email) {
-    return { 
-      isPremium: false, 
-      isInSheet: false,
-      message: 'No email provided'
-    };
+    return { isPremium: false, isInSheet: false, message: 'No email provided' };
   }
-  
-  try {
-    // If sheets client isn't initialized, initialize it
-    if (!sheetsClient || !SHEET_TAB_NAME) {
-      const initialized = await initializeSheetsClient();
-      if (!initialized) {
-        console.log('Google Sheets client initialization failed, using fallback');
-        return { 
-          isPremium: false, 
-          isInSheet: false,
-          message: 'Failed to connect to database'
-        };
-      }
-    }
-    
-    // Fetch sheet data
-    const response = await sheetsClient.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TAB_NAME}!A:F`
-    });
-    
-    const rows = response.data.values;
-    if (!rows || rows.length === 0) {
-      console.log('No data found in sheet');
-      return { 
-        isPremium: false, 
-        isInSheet: false,
-        message: 'No data in database'
-      };
-    }
-    
-    // Find the header row to get column indexes
-    const headers = rows[0].map(header => header.toLowerCase().trim());
-    
-    const emailColumnIndex = headers.findIndex(h => h.includes('email'));
-    const startDateColumnIndex = headers.findIndex(h => h.includes('start'));
-    const endDateColumnIndex = headers.findIndex(h => h.includes('end'));
-    const cancelledColumnIndex = headers.findIndex(h => h.includes('cancel'));
-    
-    if (emailColumnIndex === -1) {
-      console.error('Email column not found in spreadsheet');
-      return { 
-        isPremium: false, 
-        isInSheet: false,
-        message: 'Database structure error'
-      };
-    }
-    
-    // Look for user email
-    const normalizedEmail = email.toLowerCase().trim();
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      if (row.length > emailColumnIndex && row[emailColumnIndex]) {
-        const sheetEmail = row[emailColumnIndex].toLowerCase().trim();
-        if (sheetEmail === normalizedEmail) {
-          // Found the user
-          console.log(`Found user ${email} in sheet at row ${i + 1}`);
-          
-          // Make sure all data is properly extracted and logged for debugging
-          const startDate = (startDateColumnIndex !== -1 && row[startDateColumnIndex]) || null;
-          const endDate = (endDateColumnIndex !== -1 && row[endDateColumnIndex]) || null;
-          const isCancelled = (cancelledColumnIndex !== -1 && row[cancelledColumnIndex]) 
-            ? row[cancelledColumnIndex].toLowerCase() === 'true'
-            : false;
-          
-          console.log(`DEBUG - Raw subscription details from sheet:`);
-          console.log(`- Start Date: '${startDate}'`);
-          console.log(`- End Date: '${endDate}'`);
-          console.log(`- Cancelled: '${row[cancelledColumnIndex]}' (parsed as: ${isCancelled})`);
-          
-          // Calculate days remaining - only if we have a valid end date
-          let daysRemaining = null;
-          if (endDate && endDate.trim() !== '') {
-            daysRemaining = calculateDaysRemaining(endDate);
-            console.log(`- Days Remaining: ${daysRemaining}`);
-          }
-          
-          // PREMIUM LOGIC:
-          // User is premium if:
-          // 1. They are in the sheet AND
-          // 2. Either:
-          //    a. End date hasn't passed (even if cancelled)
-          //    b. No end date AND not cancelled (lifetime)
-          let isPremium = false;
-          let reason = '';
-          
-          const now = new Date();
-          
-          // If we have an end date, check if it's in the future
-          if (endDate && endDate.trim() !== '') {
-            try {
-              const subscriptionEnd = new Date(endDate);
-              console.log(`DEBUG - Date comparison: Current (${now.toISOString()}) vs End (${subscriptionEnd.toISOString()})`);
-              
-              if (subscriptionEnd >= now) {
-                // End date is in the future - user is premium regardless of cancellation
-                isPremium = true;
-                reason = isCancelled ? 
-                  `Premium until ${endDate} despite cancellation` : 
-                  `Active subscription until ${endDate}`;
-              } else {
-                // End date has passed
-                isPremium = false;
-                reason = `Subscription expired on ${endDate}`;
-              }
-            } catch (dateError) {
-              console.error(`Error parsing date: ${dateError}`);
-              // Default to non-premium if date parsing fails
-              isPremium = false;
-              reason = `Error validating subscription date`;
-            }
-          } else {
-            // No end date - lifetime subscription unless cancelled
-            isPremium = !isCancelled;
-            reason = isCancelled ? 
-              'Lifetime subscription cancelled' : 
-              'Lifetime subscription active';
-          }
-          
-          return {
-            isPremium,
-            isInSheet: true,
-            subscriptionData: {
-              startDate,
-              endDate,
-              isCancelled,
-              daysRemaining,
-              reason
-            }
-          };
+
+  if (!sheetsClient || !SHEET_TAB_NAME) {
+    await initializeSheetsClient();
+  }
+
+  const resp = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${SHEET_TAB_NAME}!A:G`
+  });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) {
+    return { isPremium: false, isInSheet: false, message: 'No data found' };
+  }
+
+  // Find header indexes
+  const headers = rows[0].map(h => h.toLowerCase().trim());
+  const emailIdx   = headers.findIndex(h => h.includes('email'));
+  const cancelIdx  = headers.findIndex(h => h.includes('cancel'));
+  const endIdx     = headers.findIndex(h => h.includes('end date'));
+  const startIdx   = headers.findIndex(h => h.includes('start'));
+
+  if ([emailIdx, cancelIdx, endIdx].some(i => i < 0)) {
+    return { isPremium: false, isInSheet: false, message: 'Sheet missing required columns' };
+  }
+
+  const normalized = email.toLowerCase().trim();
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if ((row[emailIdx] || '').toLowerCase().trim() === normalized) {
+      const isCancelled = (row[cancelIdx] || '').toLowerCase() === 'true';
+      const endRaw      = (row[endIdx] || '').trim() || null;
+      const daysRem     = endRaw ? calculateDaysRemaining(endRaw) : null;
+
+      let isPremium = false, reason = '';
+      if (endRaw) {
+        const endDate = new Date(endRaw);
+        if (endDate >= new Date()) {
+          isPremium = true;
+          reason = isCancelled
+            ? `Premium until ${endRaw} despite cancellation`
+            : `Active subscription until ${endRaw}`;
+        } else {
+          reason = `Subscription expired on ${endRaw}`;
         }
+      } else {
+        // lifetime
+        isPremium = !isCancelled;
+        reason = isCancelled
+          ? 'Lifetime subscription cancelled'
+          : 'Lifetime subscription active';
       }
+
+      return {
+        isPremium,
+        isInSheet: true,
+        subscriptionData: {
+          startDate: row[startIdx] || null,
+          endDate: endRaw,
+          isCancelled,
+          daysRemaining: daysRem,
+          reason
+        }
+      };
     }
-    
-    // User not found in sheet
-    console.log(`User ${email} not found in premium sheet`);
-    return { 
-      isPremium: false, 
-      isInSheet: false,
-      message: 'User not found in database'
-    };
-    
-  } catch (error) {
-    console.error('Error checking user premium status:', error);
-    return { 
-      isPremium: false, 
-      isInSheet: false,
-      message: 'Server error checking status'
-    };
   }
+
+  return { isPremium: false, isInSheet: false, message: 'User not found' };
 }
 
-// API ROUTES
+// === Auth middleware ===
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
 
-// Simple test route
-app.get('/api/test', (req, res) => {
-  res.json({ status: 'Server is running' });
-});
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid or expired token' });
+    req.user = user;
+    next();
+  });
+}
 
-// Verify user and check premium status
+// === Routes ===
+// Health check
+app.get('/api/test', (_, res) => res.json({ status: 'OK' }));
+
+// Verify & issue JWT (30s lifespan)
 app.post('/api/verify-user', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+
   try {
-    const email = req.body.email;
-    
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
-    }
-    
-    console.log(`Verifying premium status for user: ${email}`);
-    
-    // Check user premium status in Google Sheet
-    const userStatus = await checkUserPremiumStatus(email);
-    
-    // Log detailed information about the verification
-    console.log(`DEBUG - Verification results for ${email}:`);
-    console.log(`- isPremium: ${userStatus.isPremium}`);
-    console.log(`- isInSheet: ${userStatus.isInSheet}`);
-    console.log(`- Reason: ${userStatus.subscriptionData?.reason || userStatus.message}`);
-    if (userStatus.subscriptionData) {
-      console.log(`- Days Remaining: ${userStatus.subscriptionData.daysRemaining}`);
-    }
-    
-    // Build response object without token initially
-    const responseObj = {
+    const status = await checkUserPremiumStatus(email);
+    const resp = {
       email,
-      isPremium: userStatus.isPremium,
-      isInSheet: userStatus.isInSheet,
-      subscriptionData: userStatus.subscriptionData,
-      message: userStatus.message
+      isPremium: status.isPremium,
+      isInSheet: status.isInSheet,
+      subscriptionData: status.subscriptionData,
+      message: status.message
     };
-    
-    // Only generate a JWT token if user is found in the sheet
-    if (userStatus.isInSheet) {
-      const token = jwt.sign(
-        { 
-          email, 
-          isPremium: userStatus.isPremium,
-          isInSheet: userStatus.isInSheet
-        },
+
+    if (status.isInSheet) {
+      resp.token = jwt.sign(
+        { email, isPremium: status.isPremium, isInSheet: true },
         JWT_SECRET,
-        { expiresIn: '24h' }
+        { expiresIn: '30s' }           // ← short TTL
       );
-      
-      // Add token to response only if user exists in sheet
-      responseObj.token = token;
-      console.log(`User ${email} found in sheet, premium status: ${userStatus.isPremium}`);
-    } else {
-      console.log(`User ${email} not found in sheet, no token generated`);
     }
-    
-    // Return user status (with token only if user exists)
-    return res.json(responseObj);
-    
-  } catch (error) {
-    console.error('Error in verify-user endpoint:', error);
-    return res.status(500).json({ error: 'Server error', message: error.message });
+
+    res.json(resp);
+  } catch (err) {
+    console.error('verify-user error:', err);
+    res.status(500).json({ error: 'Server error', message: err.message });
   }
 });
 
-// Chat API (premium feature)
+// Chat endpoint (must match token ↔ email)
 app.post('/api/chat', authenticateToken, async (req, res) => {
+  const { email, message } = req.body;
+  if (!email || !message) {
+    return res.status(400).json({ error: 'Email and message are required' });
+  }
+
+  // enforce that the JWT’s email matches the payload
+  if (req.user.email !== email) {
+    return res.status(403).json({
+      error: 'Authentication error',
+      reason: 'Token email mismatch'
+    });
+  }
+
   try {
-    const { email, message } = req.body;
-    
-    if (!email || !message) {
-      return res.status(400).json({ error: 'Email and message are required' });
+    const status = await checkUserPremiumStatus(email);
+    if (!status.isInSheet) {
+      return res.status(403).json({ error: 'Not a premium user', reason: 'User not found' });
     }
-    
-    console.log(`Chat request from ${email}: "${message}"`);
-    
-    // Always verify with the database regardless of token
-    // This ensures we have the latest premium status
-    const userStatus = await checkUserPremiumStatus(email);
-    
-    // Verify the email in token matches the email in request
-    if (req.user.email !== email) {
-      console.log(`Token email (${req.user.email}) doesn't match request email (${email})`);
-      return res.status(403).json({ 
-        error: 'Authentication error',
-        reason: 'Token email mismatch'
+    if (!status.isPremium) {
+      return res.status(403).json({
+        error: 'Subscription expired',
+        reason: status.subscriptionData.reason
       });
     }
-    
-    // Verify user is in sheet and has premium status
-    if (!userStatus.isInSheet) {
-      console.log(`User not found in database: ${email}`);
-      return res.status(403).json({ 
-        error: 'Premium feature unavailable',
-        reason: 'User not found in database'
-      });
-    }
-    
-    if (!userStatus.isPremium) {
-      console.log(`Premium feature unavailable for user: ${email}`);
-      return res.status(403).json({ 
-        error: 'Premium feature unavailable',
-        reason: userStatus.subscriptionData?.reason || 'Not a premium user'
-      });
-    }
-    
-    // Process chat message (simulated AI response)
-    const aiResponse = `This is a simulated AI response to: "${message}"`;
-    return res.json({ 
-      response: aiResponse,
+
+    // Simulated AI reply
+    res.json({
+      response: `AI says: "${message}"`,
       subscriptionInfo: {
-        endDate: userStatus.subscriptionData?.endDate,
-        daysRemaining: userStatus.subscriptionData?.daysRemaining
+        endDate: status.subscriptionData.endDate,
+        daysRemaining: status.subscriptionData.daysRemaining
       }
     });
-    
-  } catch (error) {
-    console.error('Error in chat endpoint:', error);
-    return res.status(500).json({ error: 'Server error', message: error.message });
+  } catch (err) {
+    console.error('chat error:', err);
+    res.status(500).json({ error: 'Server error', message: err.message });
   }
 });
 
-// Start the server
+// === Start server ===
 app.listen(PORT, async () => {
-  console.log(`=== Solveo Payment Server ===`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Local URL: http://localhost:${PORT}`);
-  
-  // Initialize Google Sheets client on startup
+  console.log(`🚀 Server listening on http://localhost:${PORT}`);
   await initializeSheetsClient();
-  
-  console.log('\nAPI ENDPOINTS:');
-  console.log(`- Test: http://localhost:${PORT}/api/test`);
-  console.log(`- Verify User: http://localhost:${PORT}/api/verify-user`);
-  console.log(`- Chat: http://localhost:${PORT}/api/chat (Protected, Premium)`);
-  
-  console.log('\nReady to handle requests');
 });
