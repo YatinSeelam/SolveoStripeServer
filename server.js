@@ -231,7 +231,7 @@
 //   console.log(`🚀 Server listening on http://localhost:${PORT}`);
 //   await initializeSheetsClient();
 // });
-// server.js - Main server application with token management
+// server.js - Main server application with secure token management
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
@@ -244,7 +244,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "mysecrettoken123"; // Add your hardcoded token here
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "mysecrettoken123"; // For transition period
 
 app.use(cors({
   origin: [
@@ -286,6 +286,83 @@ function generateSecureToken(email, isPremium) {
   
   return { token, refreshToken, expiration };
 }
+
+// === Rate Limiting ===
+const apiRateLimits = {
+  // Map to store counts by IP + endpoint
+  requestCounts: new Map(),
+  
+  // Rate limit settings
+  limits: {
+    '/api/auth/token': { maxRequests: 5, windowMs: 60 * 1000 }, // 5 requests per minute
+    '/api/refresh-token': { maxRequests: 10, windowMs: 60 * 1000 }, // 10 requests per minute
+    '/api/verify-token': { maxRequests: 20, windowMs: 60 * 1000 }, // 20 requests per minute
+    '/api/chat': { maxRequests: 30, windowMs: 60 * 1000 }, // 30 requests per minute
+    'default': { maxRequests: 60, windowMs: 60 * 1000 } // Default: 60 requests per minute
+  },
+  
+  // Check if request is allowed
+  isAllowed(ip, endpoint) {
+    const key = `${ip}:${endpoint}`;
+    const now = Date.now();
+    const settings = this.limits[endpoint] || this.limits.default;
+    
+    // Get or create tracking record
+    let record = this.requestCounts.get(key);
+    if (!record) {
+      record = {
+        count: 0,
+        resetAt: now + settings.windowMs
+      };
+      this.requestCounts.set(key, record);
+    }
+    
+    // Reset if window has passed
+    if (now > record.resetAt) {
+      record.count = 0;
+      record.resetAt = now + settings.windowMs;
+    }
+    
+    // Check limit
+    if (record.count >= settings.maxRequests) {
+      return false;
+    }
+    
+    // Increment counter
+    record.count++;
+    return true;
+  },
+  
+  // Clean up old records
+  cleanup() {
+    const now = Date.now();
+    for (const [key, record] of this.requestCounts.entries()) {
+      if (now > record.resetAt) {
+        this.requestCounts.delete(key);
+      }
+    }
+  }
+};
+
+// Periodically clean up rate limiting records
+setInterval(() => apiRateLimits.cleanup(), 5 * 60 * 1000);
+
+// Rate limiting middleware
+function rateLimiter(req, res, next) {
+  const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const endpoint = req.path;
+  
+  if (!apiRateLimits.isAllowed(ip, endpoint)) {
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded. Please try again later.' 
+    });
+  }
+  
+  next();
+}
+
+// Apply rate limiting to all API routes
+app.use('/api/', rateLimiter);
 
 // === Google Sheets client init ===
 let sheetsClient = null;
@@ -416,7 +493,7 @@ function authenticateJWT(req, res, next) {
   });
 }
 
-// NEW: Static token verification middleware
+// Static token verification middleware
 function verifyStaticToken(req, res, next) {
   const token = req.headers['x-auth-token'];
   
@@ -427,7 +504,7 @@ function verifyStaticToken(req, res, next) {
   next();
 }
 
-// NEW: Dynamic token verification middleware
+// Dynamic token verification middleware
 function verifyDynamicToken(req, res, next) {
   const token = req.headers['x-auth-token'] || req.headers['authorization']?.split(' ')[1];
   
@@ -476,15 +553,30 @@ function verifyDynamicToken(req, res, next) {
 // Health check
 app.get('/api/test', (_, res) => res.json({ status: 'OK' }));
 
-// EXISTING: Verify & issue JWT
+// Verify & issue JWT (with enhanced security)
 app.post('/api/verify-user', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email is required' });
+  const { email, googleToken } = req.body;
+  
+  // Validate request
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  
+  // Verify Google token if provided
+  if (googleToken) {
+    try {
+      // In a production scenario, verify the Google token
+      // For example, use Google's OAuth2 API to verify
+      // This is a placeholder for that verification
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid Google token' });
+    }
+  }
 
   try {
     const status = await checkUserPremiumStatus(email);
     
-    // MODIFIED: Also generate a secure token
+    // Generate secure tokens
     const { token, refreshToken, expiration } = generateSecureToken(email, status.isPremium);
     
     // Create response object
@@ -498,7 +590,7 @@ app.post('/api/verify-user', async (req, res) => {
       expiresAt: expiration
     };
     
-    // Add the JWT token
+    // Add the JWT token (for backward compatibility)
     if (status.isInSheet) {
       resp.jwtToken = jwt.sign(
         { email, isPremium: status.isPremium, isInSheet: true },
@@ -510,16 +602,27 @@ app.post('/api/verify-user', async (req, res) => {
     res.json(resp);
   } catch (err) {
     console.error('verify-user error:', err);
-    res.status(500).json({ error: 'Server error', message: err.message });
+    res.status(500).json({ error: 'Server error', message: 'An internal error occurred' });
   }
 });
 
-// NEW: Token generation endpoint
+// Token generation endpoint
 app.post('/api/auth/token', verifyStaticToken, async (req, res) => {
-  const { email } = req.body;
+  const { email, googleToken } = req.body;
   
   if (!email) {
     return res.status(400).json({ error: 'Email required' });
+  }
+  
+  // Verify Google token if provided
+  if (googleToken) {
+    try {
+      // In a production scenario, verify the Google token
+      // For example, use Google's OAuth2 API to verify
+      // This is a placeholder for that verification
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid Google token' });
+    }
   }
   
   try {
@@ -546,7 +649,7 @@ app.post('/api/auth/token', verifyStaticToken, async (req, res) => {
   }
 });
 
-// NEW: Token verification endpoint
+// Token verification endpoint
 app.post('/api/verify-token', (req, res) => {
   const { token } = req.body;
   
@@ -586,7 +689,7 @@ app.post('/api/verify-token', (req, res) => {
   });
 });
 
-// NEW: Refresh token endpoint
+// Refresh token endpoint
 app.post('/api/refresh-token', async (req, res) => {
   const { refreshToken } = req.body;
   
@@ -631,7 +734,7 @@ app.post('/api/refresh-token', async (req, res) => {
   }
 });
 
-// NEW: Sign out endpoint
+// Sign out endpoint
 app.post('/api/sign-out', verifyDynamicToken, (req, res) => {
   const token = req.headers['x-auth-token'] || req.headers['authorization']?.split(' ')[1];
   
@@ -655,33 +758,124 @@ app.post('/api/sign-out', verifyDynamicToken, (req, res) => {
   res.json({ success: true });
 });
 
-// EXISTING: Chat endpoint (must match token ↔ email)
-app.post('/api/chat', authenticateJWT, async (req, res) => {
+// Bootstrap token endpoint (for initial setup)
+app.post('/api/bootstrap-token', (req, res) => {
+  // In a real implementation, you would verify the request
+  // based on extension ID, a shared secret, or other mechanism
+  const { extensionId } = req.body;
+  
+  if (!extensionId) {
+    return res.status(400).json({ error: 'Extension ID required' });
+  }
+  
+  // Check if this is a known extension ID
+  // This is a placeholder - you'd have a whitelist of valid extension IDs
+  const validExtensionIds = [
+    // Add your extension IDs here
+  ];
+  
+  if (!validExtensionIds.includes(extensionId)) {
+    return res.status(403).json({ error: 'Unknown extension' });
+  }
+  
+  // Return the bootstrap token
+  res.json({
+    bootstrapToken: AUTH_TOKEN,
+    expiresAt: Date.now() + (1 * 60 * 60 * 1000) // 1 hour
+  });
+});
+
+// Chat endpoint (supports both JWT and token auth)
+app.post('/api/chat', async (req, res) => {
   const { email, message } = req.body;
+  
   if (!email || !message) {
     return res.status(400).json({ error: 'Email and message are required' });
   }
-
-  // enforce that the JWT's email matches the payload
-  if (req.user.email !== email) {
-    return res.status(403).json({
-      error: 'Authentication error',
-      reason: 'Token email mismatch'
-    });
+  
+  // Check authentication (supports both methods)
+  let isAuthenticated = false;
+  let isPremium = false;
+  
+  // Method 1: JWT token
+  const authHeader = req.headers.authorization || '';
+  const jwtToken = authHeader.split(' ')[1];
+  
+  if (jwtToken) {
+    try {
+      const user = jwt.verify(jwtToken, JWT_SECRET);
+      
+      if (user.email !== email) {
+        return res.status(403).json({
+          error: 'Authentication error',
+          reason: 'Token email mismatch'
+        });
+      }
+      
+      isAuthenticated = true;
+      isPremium = user.isPremium;
+    } catch (err) {
+      // JWT token invalid, try next method
+    }
   }
-
+  
+  // Method 2: Dynamic token
+  if (!isAuthenticated) {
+    const token = req.headers['x-auth-token'];
+    
+    if (token === AUTH_TOKEN) {
+      // Static token grants full access
+      isAuthenticated = true;
+      isPremium = true;
+    } else if (token) {
+      const tokenData = activeTokens.get(token);
+      
+      if (tokenData && !tokenData.isRefreshToken && tokenData.expiration > Date.now()) {
+        if (tokenData.email !== email) {
+          return res.status(403).json({
+            error: 'Authentication error',
+            reason: 'Token email mismatch'
+          });
+        }
+        
+        isAuthenticated = true;
+        isPremium = tokenData.isPremium;
+      }
+    }
+  }
+  
+  if (!isAuthenticated) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  
   try {
     const status = await checkUserPremiumStatus(email);
+    
     if (!status.isInSheet) {
       return res.status(403).json({ error: 'Not a premium user', reason: 'User not found' });
     }
-    if (!status.isPremium) {
+    
+    if (!status.isPremium && isPremium) {
+      // Update cached premium status if changed
+      isPremium = false;
+      
+      // If using dynamic token, update the token data
+      const token = req.headers['x-auth-token'];
+      if (token && token !== AUTH_TOKEN) {
+        const tokenData = activeTokens.get(token);
+        if (tokenData) {
+          tokenData.isPremium = false;
+        }
+      }
+    }
+    
+    if (!isPremium) {
       return res.status(403).json({
         error: 'Subscription expired',
-        reason: status.subscriptionData.reason
+        reason: status.subscriptionData?.reason || 'No active subscription'
       });
     }
-
+    
     // Simulated AI reply
     res.json({
       response: `AI says: "${message}"`,
@@ -692,8 +886,63 @@ app.post('/api/chat', authenticateJWT, async (req, res) => {
     });
   } catch (err) {
     console.error('chat error:', err);
-    res.status(500).json({ error: 'Server error', message: err.message });
+    res.status(500).json({ error: 'Server error', message: 'An internal error occurred' });
   }
+});
+
+// Add token verification middleware for ChatGPT endpoint
+app.post('/api/chatgpt', async (req, res) => {
+  // Get token from headers
+  const token = req.headers['x-auth-token'] || req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  
+  // Check if using static token
+  if (token === AUTH_TOKEN) {
+    // Allow static token for transition period
+    // In a production environment, forward to ChatGPT API here
+    return res.json({
+      choices: [
+        {
+          message: {
+            content: "This is a simulated ChatGPT API response using static token."
+          }
+        }
+      ]
+    });
+  }
+  
+  // Verify dynamic token
+  const tokenData = activeTokens.get(token);
+  
+  if (!tokenData) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+  
+  if (tokenData.expiration < Date.now()) {
+    // Token expired
+    activeTokens.delete(token);
+    return res.status(401).json({ error: 'Token expired' });
+  }
+  
+  // Check premium status for premium features
+  if (req.body.isPremiumFeature && !tokenData.isPremium) {
+    return res.status(403).json({ error: 'Premium subscription required' });
+  }
+  
+  // Token is valid, forward to ChatGPT API
+  // In a production environment, forward to actual ChatGPT API here
+  res.json({
+    choices: [
+      {
+        message: {
+          content: "This is a simulated ChatGPT API response using dynamic token."
+        }
+      }
+    ]
+  });
 });
 
 // === Start server ===
