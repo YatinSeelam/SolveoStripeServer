@@ -231,350 +231,157 @@
 //   console.log(`🚀 Server listening on http://localhost:${PORT}`);
 //   await initializeSheetsClient();
 // });
-// server.js - Secure token management and API endpoints
+// server.js — secure: bootstrap flow, Google‑ID verification, premium gating
+
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 const { google } = require('googleapis');
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
+const crypto  = require('crypto');
 require('dotenv').config();
 
-// Environment variables
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
+/* ───────── ENV ───────── */
+const PORT            = process.env.PORT            || 3000;
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '';
+const EXT_IDS         = (process.env.EXTENSION_IDS  || '').split(','); // comma‑separated list
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
-// Express setup
+/* ───────── APP ───────── */
 const app = express();
 app.use(cors({
   origin: [/^chrome-extension:\/\/.+$/, 'https://solveoai.vercel.app'],
-  methods: ['GET', 'POST'],
+  methods: ['GET','POST'],
   credentials: true
 }));
 app.use(express.json());
 
-// Secure token storage (use Redis in production)
-const tokenStore = {
-  tokens: new Map(),
-  
-  // Generate new token
-  create(email, isPremium) {
-    const token = crypto.randomBytes(32).toString('hex');
-    const refreshToken = crypto.randomBytes(32).toString('hex');
-    const expiration = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
-    
-    this.tokens.set(token, {
-      email, isPremium, refreshToken, expiration
-    });
-    
-    this.tokens.set(refreshToken, {
-      email, isPremium, parentToken: token, isRefreshToken: true
-    });
-    
-    return { token, refreshToken, expiration };
-  },
-  
-  // Verify token
-  verify(token) {
-    const data = this.tokens.get(token);
-    if (!data) return null;
-    
-    // Expired token
-    if (data.expiration && data.expiration < Date.now()) {
-      this.revoke(token);
-      return null;
-    }
-    
-    return data;
-  },
-  
-  // Refresh token
-  refresh(refreshToken, newPremiumStatus) {
-    const data = this.tokens.get(refreshToken);
-    if (!data || !data.isRefreshToken) return null;
-    
-    // Revoke old tokens
-    if (data.parentToken) this.revoke(data.parentToken);
-    this.tokens.delete(refreshToken);
-    
-    // Generate new tokens
-    return this.create(data.email, newPremiumStatus ?? data.isPremium);
-  },
-  
-  // Revoke token
-  revoke(token) {
-    const data = this.tokens.get(token);
-    if (!data) return;
-    
-    if (data.refreshToken) this.tokens.delete(data.refreshToken);
-    if (data.parentToken) this.tokens.delete(data.parentToken);
-    this.tokens.delete(token);
-  }
-};
+/* ───────── TOKEN STORE (swap for Redis in prod) ───────── */
+const store = new Map();
+function issueTokens(email, isPremium) {
+  const token        = crypto.randomBytes(32).toString('hex');
+  const refreshToken = crypto.randomBytes(32).toString('hex');
+  const exp          = Date.now() + 24*3600*1000;
+  store.set(token,        { email, isPremium, expires: exp, refresh: refreshToken });
+  store.set(refreshToken, { email, isPremium, isRefresh:true, parent: token });
+  return { token, refreshToken, expiresAt: exp };
+}
+function verify(token) {
+  const d = store.get(token);
+  if (!d || d.expires < Date.now()) { revoke(token); return null; }
+  return d;
+}
+function revoke(t) {
+  const d = store.get(t);
+  if (!d) return;
+  if (d.refresh) store.delete(d.refresh);
+  if (d.parent ) store.delete(d.parent);
+  store.delete(t);
+}
 
-// Rate limiting middleware
-const rateLimiter = (() => {
-  const requests = new Map();
-  const limits = {
-    '/api/auth/token': { maxRequests: 5, windowMs: 60 * 1000 },
-    '/api/refresh-token': { maxRequests: 10, windowMs: 60 * 1000 },
-    'default': { maxRequests: 30, windowMs: 60 * 1000 }
-  };
-  
-  return (req, res, next) => {
-    const ip = req.ip || req.headers['x-forwarded-for'];
-    const endpoint = req.path;
-    const key = `${ip}:${endpoint}`;
-    const now = Date.now();
-    const settings = limits[endpoint] || limits.default;
-    
-    let record = requests.get(key);
-    if (!record) {
-      record = { count: 0, resetAt: now + settings.windowMs };
-      requests.set(key, record);
-    }
-    
-    if (now > record.resetAt) {
-      record.count = 0;
-      record.resetAt = now + settings.windowMs;
-    }
-    
-    if (record.count >= settings.maxRequests) {
-      return res.status(429).json({ error: 'Rate limit exceeded' });
-    }
-    
-    record.count++;
-    next();
-  };
-})();
+/* ───────── GOOGLE VERIFY ───────── */
+const oauthClient = new google.auth.OAuth2();
+function verifyGoogleIdToken(idToken) {
+  return oauthClient.verifyIdToken({ idToken, audience: OAUTH_CLIENT_ID })
+                    .then(t => t.getPayload().email);
+}
 
-// Initialize Google Sheets
-let sheetsClient = null;
-let sheetTabName = null;
-
-async function initSheetsClient() {
+/* ───────── PREMIUM CHECK (Google Sheets) ───────── */
+let sheets = null, sheetTab = null;
+async function initSheets() {
+  if (sheets) return;
   const auth = new google.auth.GoogleAuth({
     credentials: {
       type: process.env.SERVICE_ACCOUNT_TYPE,
       project_id: process.env.SERVICE_ACCOUNT_PROJECT_ID,
       private_key_id: process.env.SERVICE_ACCOUNT_PRIVATE_KEY_ID,
-      private_key: process.env.SERVICE_ACCOUNT_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      private_key: process.env.SERVICE_ACCOUNT_PRIVATE_KEY.replace(/\\n/g,'\n'),
       client_email: process.env.SERVICE_ACCOUNT_CLIENT_EMAIL,
       client_id: process.env.SERVICE_ACCOUNT_CLIENT_ID,
-      auth_uri: process.env.SERVICE_ACCOUNT_AUTH_URI,
-      token_uri: process.env.SERVICE_ACCOUNT_TOKEN_URI,
-      auth_provider_x509_cert_url: process.env.SERVICE_ACCOUNT_AUTH_PROVIDER_X509_CERT_URL,
-      client_x509_cert_url: process.env.SERVICE_ACCOUNT_CLIENT_X509_CERT_URL
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
   });
-  
-  const client = await auth.getClient();
-  sheetsClient = google.sheets({ version: 'v4', auth: client });
-  
-  const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
-  sheetTabName = meta.data.sheets[0].properties.title;
-  console.log(`✅ Sheets connected, using tab "${sheetTabName}"`);
+  sheets = google.sheets({ version:'v4', auth: await auth.getClient() });
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
+  sheetTab  = meta.data.sheets[0].properties.title;
 }
-
-// Check user's premium status
-async function checkUserPremiumStatus(email) {
-  if (!email) return { isPremium: false, isInSheet: false };
-  if (!sheetsClient) await initSheetsClient();
-  
-  const resp = await sheetsClient.spreadsheets.values.get({
+async function isPremiumUser(email) {
+  await initSheets();
+  const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetTabName}!A:G`
+    range: `${sheetTab}!A:G`
   });
-  
   const rows = resp.data.values || [];
-  if (rows.length < 2) return { isPremium: false, isInSheet: false };
-  
-  // Find header indexes
-  const headers = rows[0].map(h => h.toLowerCase().trim());
-  const emailIdx = headers.findIndex(h => h.includes('email'));
-  const cancelIdx = headers.findIndex(h => h.includes('cancel'));
-  const endIdx = headers.findIndex(h => h.includes('end date'));
-  
-  if ([emailIdx, cancelIdx, endIdx].some(i => i < 0)) {
-    return { isPremium: false, isInSheet: false };
-  }
-  
-  // Find user row
-  const normalized = email.toLowerCase().trim();
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-    if ((row[emailIdx] || '').toLowerCase().trim() === normalized) {
-      const isCancelled = (row[cancelIdx] || '').toLowerCase() === 'true';
-      const endRaw = (row[endIdx] || '').trim() || null;
-      
-      let isPremium = false;
-      if (endRaw) {
-        // Subscription with end date
-        isPremium = new Date(endRaw) >= new Date();
-      } else {
-        // Lifetime subscription
-        isPremium = !isCancelled;
-      }
-      
-      return {
-        isPremium,
-        isInSheet: true,
-        daysRemaining: endRaw ? calculateDaysRemaining(endRaw) : null,
-        endDate: endRaw
-      };
+  const hdr  = rows[0].map(h=>h.toLowerCase());
+  const eIdx = hdr.findIndex(h=>h.includes('email'));
+  const cIdx = hdr.findIndex(h=>h.includes('cancel'));
+  const dIdx = hdr.findIndex(h=>h.includes('end'));
+  if (eIdx<0) return false;
+  for (const r of rows.slice(1)) {
+    if ((r[eIdx]||'').toLowerCase().trim() === email.toLowerCase()) {
+      if (r[cIdx]?.toLowerCase()==='true') return false;
+      if (!r[dIdx]) return true;                     // lifetime
+      return new Date(r[dIdx]) >= new Date();        // active sub?
     }
   }
-  
-  return { isPremium: false, isInSheet: false };
+  return false;
 }
 
-function calculateDaysRemaining(endDateStr) {
-  const now = new Date();
-  const end = new Date(endDateStr);
-  if (isNaN(end)) return null;
-  if (end < now) return 0;
-  return Math.ceil((end - now) / (1000 * 60 * 60 * 24));
-}
+/* ───────── BOOTSTRAP TOKEN ───────── */
+app.post('/api/bootstrap-token', (req,res) => {
+  const { extensionId } = req.body;
+  if (!EXT_IDS.includes(extensionId)) return res.status(403).json({ error:'Unknown extension' });
+  const bt  = crypto.randomBytes(32).toString('hex');
+  const exp = Date.now()+60*60*1000;
+  store.set(bt, { isBootstrap:true, exp });
+  res.json({ bootstrapToken: bt, expiresAt: exp });
+});
 
-// Auth middleware
-function authenticate(req, res, next) {
-  const token = req.headers['x-auth-token'] || req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-  
-  const userData = tokenStore.verify(token);
-  if (!userData) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-  
-  if (userData.isRefreshToken) {
-    return res.status(401).json({ error: 'Cannot use refresh token for API access' });
-  }
-  
-  req.user = {
-    email: userData.email,
-    isPremium: userData.isPremium
-  };
-  
-  next();
-}
+/* ───────── AUTH / TOKEN EXCHANGE ───────── */
+app.post('/api/auth/token', async (req,res) => {
+  const boot = store.get(req.headers['x-bootstrap-token']);
+  if (!boot || boot.exp < Date.now()) return res.status(401).json({ error:'Invalid bootstrap token' });
 
-// Routes
-app.get('/api/test', (_, res) => res.json({ status: 'OK' }));
-
-app.post('/api/auth/token', rateLimiter, async (req, res) => {
-  const { email, googleToken } = req.body;
-  
-  if (!email) {
-    return res.status(400).json({ error: 'Email required' });
-  }
-  
   try {
-    // Verify Google token (implement proper verification in production)
-    if (googleToken) {
-      // Verification would go here
-    }
-    
-    // Check user premium status
-    const userStatus = await checkUserPremiumStatus(email);
-    
-    // Generate secure token
-    const { token, refreshToken, expiration } = tokenStore.create(
-      email, 
-      userStatus.isPremium
-    );
-    
-    res.json({
-      token,
-      refreshToken,
-      expiresAt: expiration,
-      isPremium: userStatus.isPremium,
-      isInSheet: userStatus.isInSheet
-    });
-  } catch (error) {
-    console.error('Token generation error:', error);
-    res.status(500).json({ error: 'Server error' });
+    const email = await verifyGoogleIdToken(req.body.googleToken);
+    const premium = await isPremiumUser(email);
+    const creds = issueTokens(email, premium);
+    res.json({ email, isPremium: premium, ...creds });
+  } catch (e) {
+    console.error('Auth error', e);
+    res.status(401).json({ error:'Invalid Google token' });
   }
 });
 
-app.post('/api/refresh-token', rateLimiter, async (req, res) => {
-  const { refreshToken, email } = req.body;
-  
-  if (!refreshToken || !email) {
-    return res.status(400).json({ error: 'Refresh token and email required' });
-  }
-  
-  try {
-    // Check latest premium status
-    const status = await checkUserPremiumStatus(email);
-    
-    if (!status.isInSheet) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Generate new tokens with updated premium status
-    const tokens = tokenStore.refresh(refreshToken, status.isPremium);
-    
-    if (!tokens) {
-      return res.status(401).json({ error: 'Invalid refresh token' });
-    }
-    
-    res.json({
-      token: tokens.token,
-      refreshToken: tokens.refreshToken,
-      expiresAt: tokens.expiration,
-      isPremium: status.isPremium
-    });
-  } catch (error) {
-    console.error('Token refresh error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
+/* ───────── REFRESH ───────── */
+app.post('/api/refresh-token', async (req,res) => {
+  const old = verify(req.body.refreshToken);
+  if (!old || !old.isRefresh) return res.status(401).json({ error:'Bad refresh token' });
+  revoke(req.body.refreshToken);
+  const premium = await isPremiumUser(old.email);
+  const creds   = issueTokens(old.email, premium);
+  res.json(creds);
 });
 
-app.post('/api/sign-out', authenticate, (req, res) => {
-  const token = req.headers['x-auth-token'] || req.headers.authorization?.split(' ')[1];
-  tokenStore.revoke(token);
-  res.json({ success: true });
+/* ───────── SIGN‑OUT ───────── */
+app.post('/api/sign-out', (req,res) => {
+  const tok = req.headers.authorization?.split(' ')[1];
+  revoke(tok);
+  res.json({ success:true });
 });
 
-app.post('/api/chatgpt', authenticate, async (req, res) => {
-  // Check premium status
-  if (!req.user.isPremium && req.body.isPremiumFeature) {
-    return res.status(403).json({ error: 'Premium subscription required' });
+/* ───────── CHATGPT PROXY ───────── */
+app.post('/api/chatgpt', async (req,res) => {
+  const tok  = req.headers.authorization?.split(' ')[1];
+  const data = verify(tok);
+  if (!data) return res.status(401).json({ error:'Invalid token' });
+
+  const premium = await isPremiumUser(data.email);   // always re‑check
+  if (!premium && req.body.isPremiumFeature) {
+    return res.status(403).json({ error:'Premium required' });
   }
-  
-  // Verify latest premium status from database
-  const status = await checkUserPremiumStatus(req.user.email);
-  
-  if (!status.isInSheet) {
-    return res.status(403).json({ error: 'User not found' });
-  }
-  
-  if (!status.isPremium) {
-    return res.status(403).json({ 
-      error: 'Subscription expired',
-      endDate: status.endDate
-    });
-  }
-  
-  // In production, forward to actual ChatGPT API here
-  // This is a simulated response
-  res.json({
-    choices: [
-      {
-        message: {
-          content: "This is a secure ChatGPT API response."
-        }
-      }
-    ]
-  });
+
+  // Forward to real OpenAI here in production …
+  res.json({ choices:[{ message:{ content:'Secure ChatGPT response.' } }] });
 });
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  await initSheetsClient();
-});
+/* ───────── SERVER START ───────── */
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
