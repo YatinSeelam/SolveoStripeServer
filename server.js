@@ -271,7 +271,10 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // Initialize Google OAuth2 client
-const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID);
+const oauth2Client = new OAuth2Client({
+  clientId: GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET
+});
 
 // JWT Token management
 const tokenManager = {
@@ -444,7 +447,15 @@ async function verifyGoogleToken(token) {
       idToken: token,
       audience: GOOGLE_CLIENT_ID
     });
-    return ticket.getPayload();
+    const payload = ticket.getPayload();
+    
+    // Verify the token was issued to our application
+    if (payload.aud !== GOOGLE_CLIENT_ID) {
+      console.error('Token was not issued for this application');
+      return null;
+    }
+    
+    return payload;
   } catch (error) {
     console.error('Google token verification failed:', error);
     return null;
@@ -465,8 +476,13 @@ app.post('/api/auth/token', async (req, res) => {
     // Verify Google token
     if (googleToken) {
       const payload = await verifyGoogleToken(googleToken);
-      if (!payload || payload.email !== email) {
+      if (!payload) {
         return res.status(401).json({ error: 'Invalid Google token' });
+      }
+      
+      // Verify email matches
+      if (payload.email !== email) {
+        return res.status(401).json({ error: 'Email mismatch' });
       }
     }
     
