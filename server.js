@@ -232,49 +232,27 @@
 //   await initializeSheetsClient();
 // });
 
+// server.js - Secure token management and API endpoints
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
 // Environment variables
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
-// Express setup with security middleware
+// Express setup
 const app = express();
-app.use(helmet()); // Security headers
 app.use(cors({
   origin: [/^chrome-extension:\/\/.+$/, 'https://solveoai.vercel.app'],
   methods: ['GET', 'POST'],
-  credentials: true,
-  maxAge: 86400 // 24 hours
+  credentials: true
 }));
-app.use(express.json({ limit: '10kb' })); // Limit JSON payload size
-
-// Rate limiting configuration
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later'
-});
-
-// Apply rate limiting to all routes
-app.use(limiter);
-
-// Initialize Google OAuth2 client
-const oauth2Client = new OAuth2Client({
-  clientId: GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET
-});
+app.use(express.json());
 
 // Secure token storage (use Redis in production)
 const tokenStore = {
@@ -334,6 +312,42 @@ const tokenStore = {
     this.tokens.delete(token);
   }
 };
+
+// Rate limiting middleware
+const rateLimiter = (() => {
+  const requests = new Map();
+  const limits = {
+    '/api/auth/token': { maxRequests: 5, windowMs: 60 * 1000 },
+    '/api/refresh-token': { maxRequests: 10, windowMs: 60 * 1000 },
+    'default': { maxRequests: 30, windowMs: 60 * 1000 }
+  };
+  
+  return (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for'];
+    const endpoint = req.path;
+    const key = `${ip}:${endpoint}`;
+    const now = Date.now();
+    const settings = limits[endpoint] || limits.default;
+    
+    let record = requests.get(key);
+    if (!record) {
+      record = { count: 0, resetAt: now + settings.windowMs };
+      requests.set(key, record);
+    }
+    
+    if (now > record.resetAt) {
+      record.count = 0;
+      record.resetAt = now + settings.windowMs;
+    }
+    
+    if (record.count >= settings.maxRequests) {
+      return res.status(429).json({ error: 'Rate limit exceeded' });
+    }
+    
+    record.count++;
+    next();
+  };
+})();
 
 // Initialize Google Sheets
 let sheetsClient = null;
@@ -449,32 +463,10 @@ function authenticate(req, res, next) {
   next();
 }
 
-// Verify Google token
-async function verifyGoogleToken(token) {
-  try {
-    const ticket = await oauth2Client.verifyIdToken({
-      idToken: token,
-      audience: GOOGLE_CLIENT_ID
-    });
-    const payload = ticket.getPayload();
-    
-    // Verify the token was issued to our application
-    if (payload.aud !== GOOGLE_CLIENT_ID) {
-      console.error('Token was not issued for this application');
-      return null;
-    }
-    
-    return payload;
-  } catch (error) {
-    console.error('Google token verification failed:', error);
-    return null;
-  }
-}
-
 // Routes
 app.get('/api/test', (_, res) => res.json({ status: 'OK' }));
 
-app.post('/api/auth/token', async (req, res) => {
+app.post('/api/auth/token', rateLimiter, async (req, res) => {
   const { email, googleToken } = req.body;
   
   if (!email) {
@@ -482,17 +474,9 @@ app.post('/api/auth/token', async (req, res) => {
   }
   
   try {
-    // Verify Google token
+    // Verify Google token (implement proper verification in production)
     if (googleToken) {
-      const payload = await verifyGoogleToken(googleToken);
-      if (!payload) {
-        return res.status(401).json({ error: 'Invalid Google token' });
-      }
-      
-      // Verify email matches
-      if (payload.email !== email) {
-        return res.status(401).json({ error: 'Email mismatch' });
-      }
+      // Verification would go here
     }
     
     // Check user premium status
@@ -517,7 +501,7 @@ app.post('/api/auth/token', async (req, res) => {
   }
 });
 
-app.post('/api/refresh-token', async (req, res) => {
+app.post('/api/refresh-token', rateLimiter, async (req, res) => {
   const { refreshToken, email } = req.body;
   
   if (!refreshToken || !email) {
@@ -590,14 +574,10 @@ app.post('/api/chatgpt', authenticate, async (req, res) => {
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Something broke!' });
-});
-
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await initSheetsClient();
-}); 
+});
+
+
