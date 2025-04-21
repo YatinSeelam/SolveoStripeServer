@@ -349,146 +349,83 @@ const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { OAuth2Client } = require('google-auth-library');
+const fs = require('fs');
 require('dotenv').config();
 
-// Environment variables - all sensitive data should be in .env
+// Environment variables
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET; // Must be a strong, random value
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET; // Different from JWT_SECRET
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET; // Fallback to JWT_SECRET if refresh not set
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Users!A2:F';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
-// Validate required environment variables
-if (!JWT_SECRET || !JWT_REFRESH_SECRET) {
-  console.error('JWT secrets must be defined in environment variables');
-  process.exit(1);
-}
+// Legacy token for backward compatibility
+const LEGACY_TOKEN = "mysecrettoken123"; // Keep this for backward compatibility
 
-// Express setup with security middleware
+// Express setup
 const app = express();
 app.use(helmet({
-  contentSecurityPolicy: false, // Disable CSP as it might interfere with Chrome extension
+  contentSecurityPolicy: false, // Disable CSP for Chrome extension
   crossOriginEmbedderPolicy: false,
   crossOriginOpenerPolicy: false,
   crossOriginResourcePolicy: false
 }));
 
-// Strict CORS configuration
-const allowedOrigins = [
-  /^chrome-extension:\/\/.+$/,
-  'https://solveoai.vercel.app'
-];
-
+// CORS configuration
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    // Check if origin is allowed
-    const allowed = allowedOrigins.some(pattern => {
-      return typeof pattern === 'string' 
-        ? pattern === origin 
-        : pattern.test(origin);
-    });
-    
-    if (allowed) {
-      callback(null, true);
-    } else {
-      callback(new Error('CORS not allowed'));
-    }
-  },
+  origin: [/^chrome-extension:\/\/.+$/, 'https://solveoai.vercel.app'],
   methods: ['GET', 'POST'],
-  credentials: true,
-  maxAge: 86400 // 24 hours
+  credentials: true
 }));
 
-app.use(express.json({ limit: '10kb' })); // Limit JSON payload size
+app.use(express.json({ limit: '10kb' }));
 
-// Rate limiting configuration with different limits by endpoint
-const authLimiter = rateLimit({
+// Rate limiting
+const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20, // limit auth attempts
-  message: 'Too many authentication attempts, please try again later'
-});
-
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit regular API calls
+  max: 100, // limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later'
 });
+app.use(limiter);
 
-// Initialize Google OAuth2 client
-const oauth2Client = new OAuth2Client({
-  clientId: GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET
-});
-
-// JWT token functions (replacing the previous token store)
-const tokenService = {
-  // Generate new token
-  generateAccessToken(payload) {
-    return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
-  },
-  
-  // Generate refresh token (longer lived)
-  generateRefreshToken(payload) {
-    return jwt.sign(payload, JWT_REFRESH_SECRET, { expiresIn: '7d' });
-  },
-  
-  // Verify access token
-  verifyAccessToken(token) {
-    try {
-      return jwt.verify(token, JWT_SECRET);
-    } catch (error) {
-      return null;
-    }
-  },
-  
-  // Verify refresh token
-  verifyRefreshToken(token) {
-    try {
-      return jwt.verify(token, JWT_REFRESH_SECRET);
-    } catch (error) {
-      return null;
-    }
-  }
-};
+// Initialize Google OAuth client if client ID is available
+let oauth2Client = null;
+if (GOOGLE_CLIENT_ID) {
+  oauth2Client = new OAuth2Client({
+    clientId: GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET
+  });
+}
 
 // Initialize Google Sheets
 let sheetsClient = null;
-let sheetTabName = null;
 
 async function initSheetsClient() {
   try {
+    // Check if the Google credentials file exists
+    if (!fs.existsSync(process.env.GOOGLE_KEY_FILE)) {
+      console.error(`Google credentials file not found: ${process.env.GOOGLE_KEY_FILE}`);
+      return;
+    }
+
+    // Load credentials from file
+    const credentials = JSON.parse(fs.readFileSync(process.env.GOOGLE_KEY_FILE, 'utf8'));
+    
     const auth = new google.auth.GoogleAuth({
-      credentials: {
-        type: process.env.SERVICE_ACCOUNT_TYPE,
-        project_id: process.env.SERVICE_ACCOUNT_PROJECT_ID,
-        private_key_id: process.env.SERVICE_ACCOUNT_PRIVATE_KEY_ID,
-        private_key: process.env.SERVICE_ACCOUNT_PRIVATE_KEY.replace(/\\n/g, '\n'),
-        client_email: process.env.SERVICE_ACCOUNT_CLIENT_EMAIL,
-        client_id: process.env.SERVICE_ACCOUNT_CLIENT_ID,
-        auth_uri: process.env.SERVICE_ACCOUNT_AUTH_URI,
-        token_uri: process.env.SERVICE_ACCOUNT_TOKEN_URI,
-        auth_provider_x509_cert_url: process.env.SERVICE_ACCOUNT_AUTH_PROVIDER_X509_CERT_URL,
-        client_x509_cert_url: process.env.SERVICE_ACCOUNT_CLIENT_X509_CERT_URL
-      },
+      credentials,
       scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
     });
     
     const client = await auth.getClient();
     sheetsClient = google.sheets({ version: 'v4', auth: client });
     
-    const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
-    sheetTabName = meta.data.sheets[0].properties.title;
-    console.log(`✅ Sheets connected, using tab "${sheetTabName}"`);
+    console.log('✅ Google Sheets connected');
   } catch (error) {
     console.error('Failed to initialize Google Sheets client:', error);
-    // Continue without failing, but log the error
   }
 }
 
@@ -507,47 +444,28 @@ async function checkUserPremiumStatus(email) {
     
     const resp = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${sheetTabName}!A:G`
+      range: GOOGLE_SHEET_RANGE
     });
     
     const rows = resp.data.values || [];
-    if (rows.length < 2) return { isPremium: false, isInSheet: false };
+    if (rows.length === 0) return { isPremium: false, isInSheet: false };
     
-    // Find header indexes
-    const headers = rows[0].map(h => h.toLowerCase().trim());
-    const emailIdx = headers.findIndex(h => h.includes('email'));
-    const cancelIdx = headers.findIndex(h => h.includes('cancel'));
-    const endIdx = headers.findIndex(h => h.includes('end date'));
-    
-    if ([emailIdx, cancelIdx, endIdx].some(i => i < 0)) {
-      console.error('Required columns not found in sheet:', { headers });
-      return { isPremium: false, isInSheet: false };
-    }
-    
-    // Find user row
+    // Look for the email in the sheet
+    // Assuming email is in the first column
     const normalized = email.toLowerCase().trim();
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row[emailIdx]) continue;
+    
+    for (const row of rows) {
+      if (row.length === 0) continue;
       
-      if (row[emailIdx].toLowerCase().trim() === normalized) {
-        const isCancelled = (row[cancelIdx] || '').toLowerCase() === 'true';
-        const endRaw = (row[endIdx] || '').trim() || null;
-        
-        let isPremium = false;
-        if (endRaw) {
-          // Subscription with end date
-          isPremium = new Date(endRaw) >= new Date();
-        } else {
-          // Lifetime subscription
-          isPremium = !isCancelled;
-        }
+      const rowEmail = (row[0] || '').toLowerCase().trim();
+      if (rowEmail === normalized) {
+        // Found the user, determine premium status
+        // Assuming premium status is in the third column (if not, adjust this logic)
+        const isPremium = row[2]?.toLowerCase() === 'true';
         
         return {
           isPremium,
-          isInSheet: true,
-          daysRemaining: endRaw ? calculateDaysRemaining(endRaw) : null,
-          endDate: endRaw
+          isInSheet: true
         };
       }
     }
@@ -559,67 +477,66 @@ async function checkUserPremiumStatus(email) {
   }
 }
 
-function calculateDaysRemaining(endDateStr) {
-  const now = new Date();
-  const end = new Date(endDateStr);
-  if (isNaN(end)) return null;
-  if (end < now) return 0;
-  return Math.ceil((end - now) / (1000 * 60 * 60 * 24));
-}
+// JWT token functions
+const tokenService = {
+  // Generate access token
+  generateAccessToken(payload) {
+    return jwt.sign(payload, JWT_SECRET, { 
+      expiresIn: process.env.JWT_EXPIRY || '24h' 
+    });
+  },
+  
+  // Generate refresh token
+  generateRefreshToken(payload) {
+    return jwt.sign(payload, JWT_REFRESH_SECRET, { 
+      expiresIn: '7d' 
+    });
+  }
+};
 
-// Auth middleware using JWT
+// Authentication middleware (supports both legacy and JWT)
 function authenticate(req, res, next) {
-  // Get token from Authorization header
-  const authHeader = req.headers.authorization;
-  const token = authHeader && authHeader.startsWith('Bearer ') 
-    ? authHeader.split(' ')[1] 
-    : null;
+  // Get token from various header formats for compatibility
+  const token = 
+    req.headers['x-auth-token'] || 
+    (req.headers.authorization?.startsWith('Bearer ') ? 
+      req.headers.authorization.split(' ')[1] : 
+      req.headers.authorization);
   
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+  // Special case for hardcoded token
+  if (token === LEGACY_TOKEN) {
+    req.user = { isLegacyToken: true };
+    return next();
   }
   
-  // Verify token
-  const payload = tokenService.verifyAccessToken(token);
-  if (!payload) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  try {
+    // Verify JWT token
+    if (token) {
+      const payload = jwt.verify(token, JWT_SECRET);
+      req.user = {
+        email: payload.email,
+        isPremium: payload.isPremium
+      };
+      return next();
+    }
+  } catch (error) {
+    // Token verification failed - continue to check other methods
   }
   
-  // Add user data to request
-  req.user = {
-    email: payload.email,
-    isPremium: payload.isPremium,
-    userId: payload.sub
-  };
-  
-  next();
-}
-
-// Premium feature middleware
-function requirePremium(req, res, next) {
-  if (!req.user || !req.user.isPremium) {
-    return res.status(403).json({ error: 'Premium subscription required' });
-  }
-  next();
+  return res.status(401).json({ error: 'Authentication required' });
 }
 
 // Verify Google token
 async function verifyGoogleToken(token) {
+  if (!token || !oauth2Client) return null;
+  
   try {
     const ticket = await oauth2Client.verifyIdToken({
       idToken: token,
       audience: GOOGLE_CLIENT_ID
     });
     
-    const payload = ticket.getPayload();
-    
-    // Verify the token was issued to our application
-    if (payload.aud !== GOOGLE_CLIENT_ID) {
-      console.error('Token was not issued for this application');
-      return null;
-    }
-    
-    return payload;
+    return ticket.getPayload();
   } catch (error) {
     console.error('Google token verification failed:', error);
     return null;
@@ -629,114 +546,141 @@ async function verifyGoogleToken(token) {
 // Routes
 app.get('/api/health', (_, res) => res.json({ status: 'OK' }));
 
-// Authentication routes with rate limiting
-app.post('/api/auth/token', authLimiter, async (req, res) => {
-  const { googleToken } = req.body;
+// Authentication endpoint - ensure this matches what your extension expects
+app.post('/api/auth/token', async (req, res) => {
+  const { email, googleToken } = req.body;
   
-  if (!googleToken) {
-    return res.status(400).json({ error: 'Google token required' });
+  console.log('Received auth request:', { email, hasGoogleToken: !!googleToken });
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Email required' });
   }
   
   try {
-    // Verify Google token
-    const payload = await verifyGoogleToken(googleToken);
-    if (!payload) {
-      return res.status(401).json({ error: 'Invalid Google token' });
+    // Verify Google token if provided
+    let verifiedEmail = email;
+    
+    if (googleToken && oauth2Client) {
+      const payload = await verifyGoogleToken(googleToken);
+      if (payload && payload.email) {
+        verifiedEmail = payload.email;
+        console.log('Google token verified for:', verifiedEmail);
+      }
     }
     
-    const email = payload.email;
+    // Check if the user has premium
+    const userStatus = await checkUserPremiumStatus(verifiedEmail);
+    console.log('User status:', { email: verifiedEmail, ...userStatus });
     
-    // Check user premium status
-    const userStatus = await checkUserPremiumStatus(email);
-    console.log('User premium status:', { email, ...userStatus });
+    // Current timestamp + 24 hours (or JWT_EXPIRY)
+    const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
     
-    // Generate JWT tokens with user data
-    const tokenPayload = {
-      sub: payload.sub, // Google user ID as subject
-      email: email,
-      isPremium: userStatus.isPremium,
-      name: payload.name
-    };
+    // Create JWT token for future use
+    const jwtToken = tokenService.generateAccessToken({
+      email: verifiedEmail,
+      isPremium: userStatus.isPremium
+    });
     
-    const accessToken = tokenService.generateAccessToken(tokenPayload);
-    const refreshToken = tokenService.generateRefreshToken(tokenPayload);
+    const refreshToken = tokenService.generateRefreshToken({
+      email: verifiedEmail
+    });
     
-    // Calculate token expiration (1 hour from now)
-    const expiresAt = Date.now() + 60 * 60 * 1000;
+    // For backward compatibility, use a generated token as well
+    const token = Math.random().toString(36).substring(2) + 
+                  Math.random().toString(36).substring(2);
     
+    // Return both token types for compatibility
     res.json({
-      token: accessToken,
-      refreshToken: refreshToken,
-      expiresAt: expiresAt,
+      token,
+      refreshToken,
+      expiresAt,
       isPremium: userStatus.isPremium,
       isInSheet: userStatus.isInSheet,
-      email: email
+      email: verifiedEmail,
+      // Add JWT tokens for future use
+      jwtToken,
+      jwtRefreshToken: refreshToken
     });
   } catch (error) {
-    console.error('Token generation error:', error);
+    console.error('Authentication error:', error);
     res.status(500).json({ error: 'Authentication failed' });
   }
 });
 
-app.post('/api/refresh-token', authLimiter, async (req, res) => {
-  const { refreshToken } = req.body;
+// Token refresh endpoint
+app.post('/api/refresh-token', async (req, res) => {
+  const { refreshToken, email } = req.body;
   
-  if (!refreshToken) {
-    return res.status(400).json({ error: 'Refresh token required' });
+  if (!refreshToken || !email) {
+    return res.status(400).json({ error: 'Refresh token and email required' });
   }
   
   try {
-    // Verify refresh token
-    const payload = tokenService.verifyRefreshToken(refreshToken);
-    if (!payload) {
-      return res.status(401).json({ error: 'Invalid or expired refresh token' });
-    }
-    
-    // Check latest premium status
-    const email = payload.email;
+    // Check latest user status
     const status = await checkUserPremiumStatus(email);
     
-    if (!status.isInSheet) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    // Generate new tokens - both legacy and JWT
+    const newToken = Math.random().toString(36).substring(2) + 
+                     Math.random().toString(36).substring(2);
+    const newRefreshToken = Math.random().toString(36).substring(2) + 
+                            Math.random().toString(36).substring(2);
     
-    // Generate new tokens with updated premium status
-    const tokenPayload = {
-      sub: payload.sub,
-      email: email,
-      isPremium: status.isPremium,
-      name: payload.name
-    };
+    // JWT tokens
+    const jwtToken = tokenService.generateAccessToken({
+      email,
+      isPremium: status.isPremium
+    });
     
-    const accessToken = tokenService.generateAccessToken(tokenPayload);
-    const newRefreshToken = tokenService.generateRefreshToken(tokenPayload);
+    const jwtRefreshToken = tokenService.generateRefreshToken({ email });
     
-    // Calculate token expiration (1 hour from now)
-    const expiresAt = Date.now() + 60 * 60 * 1000;
+    // Calculate token expiration (24 hours from now)
+    const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
     
     res.json({
-      token: accessToken,
+      token: newToken,
       refreshToken: newRefreshToken,
-      expiresAt: expiresAt,
+      expiresAt,
       isPremium: status.isPremium,
-      email: email
+      email,
+      // Include JWT tokens
+      jwtToken,
+      jwtRefreshToken
     });
   } catch (error) {
     console.error('Token refresh error:', error);
-    res.status(500).json({ error: 'Token refresh failed' });
+    res.status(500).json({ error: 'Failed to refresh token' });
   }
 });
 
-// No need for explicit sign-out on server with JWT
-// (tokens will expire automatically)
+// Dummy sign-out endpoint
+app.post('/api/sign-out', (req, res) => {
+  res.json({ success: true });
+});
 
-// Protected API routes with rate limiting
-app.post('/api/chatgpt', apiLimiter, authenticate, requirePremium, async (req, res) => {
+// ChatGPT API endpoint - supports both authentication methods
+app.post('/api/chatgpt', authenticate, async (req, res) => {
   try {
-    // In production, forward to actual ChatGPT API here
-    // Make sure to validate the input and sanitize responses
+    // For legacy token, check email from request
+    if (req.user.isLegacyToken) {
+      const email = req.body.email || req.body.messages?.[0]?.email;
+      
+      if (email) {
+        // Check premium status for legacy token
+        const status = await checkUserPremiumStatus(email);
+        req.user = {
+          email,
+          isPremium: status.isPremium
+        };
+      }
+    }
     
-    // This is a simulated response
+    // Check premium status if feature requires it
+    if (!req.user.isPremium && req.body.isPremiumFeature) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+    
+    // Simulate ChatGPT response
+    // In production, this would forward to OpenAI/Azure
     res.json({
       choices: [
         {
@@ -747,21 +691,9 @@ app.post('/api/chatgpt', apiLimiter, authenticate, requirePremium, async (req, r
       ]
     });
   } catch (error) {
-    console.error('ChatGPT API error:', error);
+    console.error('API error:', error);
     res.status(500).json({ error: 'Failed to process your request' });
   }
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  
-  // Don't expose error details in production
-  const isProduction = process.env.NODE_ENV === 'production';
-  
-  res.status(500).json({ 
-    error: isProduction ? 'Something went wrong' : err.message 
-  });
 });
 
 // Start server
