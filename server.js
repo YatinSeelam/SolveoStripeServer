@@ -1,4 +1,4 @@
-// server.js - Secure token management and API endpoints
+// proxy server solveostripeserver hosted on solveo-stripe-server.vercel.app
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
